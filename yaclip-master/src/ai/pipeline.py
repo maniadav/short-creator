@@ -1,0 +1,1227 @@
+from __future__ import annotations
+
+import concurrent.futures
+import gc
+import json
+from pathlib import Path
+from typing import Any
+
+from loguru import logger
+
+from src.ai.api_client import (
+    gemini_delete_quiet,
+    gemini_generate,
+    gemini_upload_and_wait,
+)
+from src.ai.heatmap import HeatmapAnalyzer
+from src.ai.llm_cloud import CloudLLMProvider
+from src.ai.llm_local import LocalLLMProvider
+from src.ai.prompts import (
+    build_detection_evidence_block,
+    build_language_instruction,
+    get_system_prompt,
+    strip_json_markdown,
+)
+from src.ai.stt_cloud import CloudSTTProvider
+from src.ai.stt_local import (
+    LocalSTTProvider,
+    save_mediashare_cache,
+    save_words_cache,
+    segments_to_transcript,
+)
+from src.core.config import load_config
+from src.core.constants import (
+    BASE_CONTENT_TYPES,
+    CANDIDATE_WINDOW_BUFFER,
+    MIN_CLIP_SECONDS,
+    STT_THREAD_POOL,
+    VISUAL_THREAD_POOL,
+    ContentType,
+)
+from src.core.exceptions import AIProviderError
+from src.core.utils import AIUtils
+from src.core.workspace import DATA_DIR, active_pipeline_event
+from src.media.energy import AudioEnergyAnalyzer
+from src.media.slicer import AudioSlicer
+
+
+class AIPipeline:
+    """Orchestrates AI tasks like STT and LLM reasoning by routing to the appropriate providers."""
+
+    def __init__(self) -> None:
+        self.config = load_config()
+
+    def is_unified_gemini_possible(self) -> bool:
+        """Returns True if both STT and LLM are configured to use cloud Google Gemini."""
+        stt_cfg = self.config.ai_pipeline.stt
+        llm_cfg = self.config.ai_pipeline.llm
+
+        stt_provider = stt_cfg.provider.lower()
+        llm_provider = llm_cfg.provider.lower()
+
+        stt_cloud_google = (
+            (stt_provider in ("cloud", "auto"))
+            and stt_cfg.cloud.provider.lower() == "google"
+            and AIUtils.has_credentials(stt_cfg.cloud.api_key)
+        )
+        llm_cloud_google = (
+            (llm_provider in ("cloud", "auto"))
+            and llm_cfg.cloud.provider.lower() == "google"
+            and AIUtils.has_credentials(llm_cfg.cloud.api_key)
+        )
+        return stt_cloud_google and llm_cloud_google
+
+    def run_unified_gemini(
+        self,
+        audio_path: str,
+        content_type: str | None,
+        target_duration: int,
+        target_clips: int,
+        detected_type: ContentType | None = None,
+        detection_evidence: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Runs a single unified Gemini call that handles both STT and LLM analysis."""
+        try:
+            import google.generativeai as genai
+        except ImportError as e:
+            logger.error("google-generativeai package is not installed.")
+            raise ImportError("google-generativeai package missing.") from e
+
+        stt_cloud_cfg = self.config.ai_pipeline.stt.cloud
+        llm_cloud_cfg = self.config.ai_pipeline.llm.cloud
+        api_key = llm_cloud_cfg.api_key or stt_cloud_cfg.api_key
+        model_name = llm_cloud_cfg.model or stt_cloud_cfg.model
+        llm_timeout = llm_cloud_cfg.timeout
+
+        genai.configure(api_key=api_key)
+        logger.info("Starting cloud AI transcription and clip selection...")
+
+        video_id = Path(audio_path).stem
+        out_txt = DATA_DIR / f"{video_id}.txt"
+
+        uploaded_file = None
+        try:
+            uploaded_file = gemini_upload_and_wait(audio_path)
+
+            sub_language = self.config.video_processing.subtitles.language
+            base_system_prompt = get_system_prompt(
+                content_type=content_type,
+                target_duration=target_duration,
+                target_clips=target_clips,
+                language=sub_language,
+            )
+
+            system_instruction = (
+                "You are an expert social media content curator and high-accuracy transcription engine. "
+                "You must perform two tasks in a single run: transcribing the audio file and extracting clips. "
+                f"You MUST identify EXACTLY {target_clips} of the most engaging/viral segments — no more, no fewer."
+            )
+
+            # Prepend detection evidence when the algorithm was uncertain.
+            evidence_block = ""
+            if detected_type is None and detection_evidence:
+                evidence_block = build_detection_evidence_block(detection_evidence)
+
+            lang_instruction = build_language_instruction(sub_language)
+
+            user_prompt = (
+                f"{evidence_block}"
+                f"Format your output ONLY as a JSON object with the following structure:\n"
+                "{\n"
+                '  "transcript": "Write the full timestamped transcript text here. Use format: [start_seconds - end_seconds] spoken text, one line per segment.",\n'
+                '  "clips": [\n'
+                "    {\n"
+                '      "start_time": float,\n'
+                '      "end_time": float,\n'
+                '      "title": "catchy hook/bait title (max 50 chars)",\n'
+                '      "caption": "short caption for social media (max 150 chars)",\n'
+                '      "description": "longer description with hook + context + CTA (max 300 chars)",\n'
+                '      "hashtags": "5-8 space-separated hashtags, e.g. #gaming #mlbb #shorts",\n'
+                '      "content_type": "string (one of PODCAST, JUST_CHAT, GAMING_SOLO, GAMING_COLLAB)",\n'
+                '      "reasoning": "one sentence explaining why this is engaging"\n'
+                "    }\n"
+                "  ]\n"
+                "}\n\n"
+                f"{lang_instruction}\n\n"
+                "Here are the specific requirements for clip extraction:\n"
+                f"{base_system_prompt}"
+            )
+
+            response_text = gemini_generate(
+                model_name,
+                [uploaded_file, user_prompt],
+                llm_timeout,
+                system_instruction=system_instruction,
+            )
+            response_text = strip_json_markdown(response_text)
+
+            data = json.loads(response_text)
+
+            transcript = data.get("transcript", "")
+            if transcript:
+                out_txt.parent.mkdir(parents=True, exist_ok=True)
+                out_txt.write_text(transcript, encoding="utf-8")
+                logger.info(f"Saved combined transcript to {out_txt}")
+
+            clips = data.get("clips", [])
+            # Enforce target_clips: LLM may return more or fewer than requested
+            if len(clips) > target_clips:
+                logger.info(f"Reducing clip count from {len(clips)} to {target_clips}.")
+                clips = clips[:target_clips]
+            elif len(clips) < target_clips:
+                logger.warning(
+                    f"Unified Gemini returned {len(clips)} clips, expected {target_clips}. "
+                    "Consider increasing candidate margin or check LLM response quality."
+                )
+            # Normalise content_type per clip (same pattern as the hybrid path)
+            for cc in clips:
+                if detected_type is not None:
+                    cc["content_type"] = detected_type.value
+                else:
+                    resolved = self._normalise_base_content_type(cc.get("content_type"))
+                    if resolved is not None:
+                        cc["content_type"] = resolved
+                    else:
+                        cc.pop("content_type", None)
+
+                    # Post-hoc validation with raw detection evidence.
+                    if detection_evidence:
+                        self._validate_clip_content_type(
+                            cc,
+                            detection_evidence,
+                            clips.index(cc) + 1,
+                            audio_path=audio_path,
+                        )
+            logger.info(f"Cloud AI found {len(clips)} clips from the video.")
+            return clips
+
+        except Exception as e:
+            logger.error(f"Combined Gemini analysis failed: {e}")
+            raise AIProviderError(f"Combined Gemini analysis failed: {e}") from e
+        finally:
+            if uploaded_file:
+                gemini_delete_quiet(uploaded_file)
+
+    def run_stt_transcription(
+        self,
+        audio_path: str,
+        force: bool = False,
+        whisper_model: object | None = None,
+        cache_dir: str | Path | None = None,
+    ) -> str:
+        """Helper to run STT transcription based on config, automatically falling back if requested."""
+        stt_cfg = self.config.ai_pipeline.stt
+        provider = stt_cfg.provider.lower()
+
+        stt_api_key = stt_cfg.cloud.api_key
+        has_cloud_credentials = AIUtils.has_credentials(stt_api_key)
+        if provider == "cloud" or (provider == "auto" and has_cloud_credentials):
+            try:
+                cloud_provider = CloudSTTProvider()
+                return cloud_provider.transcribe(audio_path, force=force)
+            except Exception as e:
+                if provider == "auto":
+                    logger.warning(
+                        f"Cloud transcription failed: {e}. Switching to local transcription."
+                    )
+                else:
+                    raise AIProviderError(f"Cloud STT failed: {e}") from e
+        local_provider = LocalSTTProvider()
+        return local_provider.transcribe(
+            audio_path, force=force, model=whisper_model, cache_dir=cache_dir
+        )
+
+    def run_llm_analysis(
+        self,
+        transcript: str,
+        content_type: str | None,
+        target_duration: int,
+        target_clips: int = 5,
+        llama_model: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Helper to run LLM transcript analysis based on config, automatically falling back if requested."""
+        llm_cfg = self.config.ai_pipeline.llm
+        provider = llm_cfg.provider.lower()
+
+        llm_api_key = llm_cfg.cloud.api_key
+        has_cloud_credentials = AIUtils.has_credentials(llm_api_key)
+        # Cloud LLM path
+        if provider == "cloud" or (provider == "auto" and has_cloud_credentials):
+            try:
+                cloud_provider = CloudLLMProvider()
+                return cloud_provider.analyze_transcript(
+                    transcript,
+                    content_type=content_type,
+                    target_duration=target_duration,
+                    target_clips=target_clips,
+                )
+            except Exception as e:
+                if provider == "auto":
+                    logger.warning(
+                        f"Cloud AI analysis failed: {e}. Switching to local AI."
+                    )
+                else:
+                    raise AIProviderError(f"Cloud AI analysis failed: {e}") from e
+
+        # Local LLM path
+        local_provider = LocalLLMProvider()
+        return local_provider.analyze_transcript(
+            transcript,
+            content_type=content_type,
+            target_duration=target_duration,
+            target_clips=target_clips,
+            llm=llama_model,
+        )
+
+    def run_batch_llm_analysis(
+        self,
+        candidates_text: str,
+        target_clips: int,
+        content_type: str,
+        target_duration: int,
+        llama_model: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Helper to run batched LLM candidate comparisons and selection based on config."""
+        llm_cfg = self.config.ai_pipeline.llm
+        provider = llm_cfg.provider.lower()
+
+        llm_api_key = llm_cfg.cloud.api_key
+        has_cloud_credentials = AIUtils.has_credentials(llm_api_key)
+
+        # Cloud LLM path
+        if provider == "cloud" or (provider == "auto" and has_cloud_credentials):
+            try:
+                cloud_provider = CloudLLMProvider()
+                return cloud_provider.analyze_batch(
+                    candidates_text,
+                    target_clips,
+                    content_type=content_type,
+                    target_duration=target_duration,
+                )
+            except Exception as e:
+                if provider == "auto":
+                    logger.warning(
+                        f"Cloud AI batch analysis failed: {e}. Switching to local AI."
+                    )
+                else:
+                    raise AIProviderError(f"Cloud AI batch analysis failed: {e}") from e
+
+        # Local LLM path
+        local_provider = LocalLLMProvider()
+        return local_provider.analyze_batch(
+            candidates_text,
+            target_clips,
+            content_type=content_type,
+            target_duration=target_duration,
+            llm=llama_model,
+        )
+
+    def _load_metadata_context(self, video_id: str) -> str:
+        """Build a compact 'Video metadata' header (title/category/tags) for the LLM prompt."""
+        meta_path = DATA_DIR / f"{video_id}_metadata.json"
+        if not meta_path.exists():
+            return ""
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Could not read video metadata: {e}")
+            return ""
+
+        categories = ", ".join(meta.get("categories") or []) or "unknown"
+        tags = ", ".join((meta.get("tags") or [])[:10])
+        parts = [
+            f"Video: {meta.get('title', '')} | Channel: {meta.get('channel', '')} | Category: {categories}",
+        ]
+        if tags:
+            parts.append(f"Tags: {tags}")
+        parts.append("")
+        return "\n".join(parts) + "\n"
+
+    @staticmethod
+    def _normalise_base_content_type(value: object) -> str | None:
+        """Validate an LLM-returned content_type against the 4 base types.
+
+        Excludes the render-time-only DONATION_OVERLAY (that promotion happens in the renderer).
+        Returns the canonical enum name, or None when the value is missing/invalid.
+        """
+        if not isinstance(value, str):
+            return None
+        name = value.strip().upper()
+        return name if name in BASE_CONTENT_TYPES else None
+
+    @staticmethod
+    def _validate_clip_content_type(
+        clip: dict[str, Any],
+        detection_evidence: dict[str, object],
+        candidate_index: int,
+        audio_path: str = "",
+    ) -> None:
+        """Post-hoc LLM output validation: algorithmic signals override LLM picks.
+
+        Used when ``detected_type`` was None (uncertain) and the LLM decided
+        per-clip.  Rules:
+          1. Audio ~1 speaker + LLM returned GAMING_COLLAB → impossible.
+             Force to GAMING_SOLO (if gameplay) or PODCAST.
+          2. Audio ≥2 speakers + gameplay_present + webcam_count≥2 → force
+             GAMING_COLLAB (LLM cannot downgrade).
+
+        Args:
+            clip: A single clip dict from the LLM response.
+            detection_evidence: Structured evidence from the video-level detector.
+            candidate_index: 1-based index for logging.
+            audio_path: Path to the audio chunk (batch path) or full audio
+                (Gemini path) for speaker counting.
+        """
+        resolved = clip.get("content_type")
+        # Must be a valid string — already normalised by _normalise_base_content_type.
+        if not isinstance(resolved, str) or resolved not in BASE_CONTENT_TYPES:
+            return
+
+        gameplay_present = bool(detection_evidence.get("gameplay_present", False))
+        webcam_count = int(detection_evidence.get("webcam_count", 0))
+
+        if not audio_path:
+            return
+
+        # Rule 1: 1 speaker cannot be COLLAB.
+        if resolved == ContentType.GAMING_COLLAB.value:
+            from src.media.energy import AudioEnergyAnalyzer
+
+            speakers = AudioEnergyAnalyzer().estimate_speaker_count(audio_path)
+            if speakers < 2:
+                resolved = (
+                    ContentType.GAMING_SOLO.value
+                    if gameplay_present
+                    else ContentType.PODCAST.value
+                )
+                clip["content_type"] = resolved
+                logger.info(
+                    f"Clip {candidate_index} corrected from collaboration to single layout "
+                    f"(audio has 1 speaker)."
+                )
+                return
+
+        # Rule 2: 2+ speakers + gameplay + 2+ webcams → force COLLAB.
+        if (
+            gameplay_present
+            and webcam_count >= 2
+            and resolved != ContentType.GAMING_COLLAB.value
+        ):
+            clip["content_type"] = ContentType.GAMING_COLLAB.value
+            logger.info(
+                f"Clip {candidate_index} set to collaboration layout "
+                f"(gameplay with {webcam_count} webcams)."
+            )
+
+    @staticmethod
+    def _enforce_duration(
+        start: float,
+        end: float,
+        win_start: float,
+        win_end: float,
+        min_d: float,
+        max_d: float,
+    ) -> tuple[float, float]:
+        """Clamp a clip to the configured [min_d, max_d] length within the candidate window.
+
+        A too-long pick is capped at ``max_d`` (keeping the hook start); a too-short pick is grown
+        symmetrically up to ``min_d``, clamped inside ``[win_start, win_end]`` (the transcribed window,
+        which is widened to ≥ max_d so the floor always fits). Returns the adjusted (start, end).
+        """
+        if end - start > max_d:
+            end = start + max_d
+        if end - start < min_d:
+            grow = (min_d - (end - start)) / 2.0
+            start = max(win_start, start - grow)
+            end = start + min_d
+            if end > win_end:
+                end = win_end
+                start = max(win_start, end - min_d)
+        return start, end
+
+    def _resolve_content_type(self, detected_type: ContentType | None) -> str | None:
+        """Resolve the content type string for the system prompt.
+
+        The video-level detector's result takes precedence over the config override.
+        When detected_type is None (uncertain), the LLM decides per-clip.
+        """
+        if detected_type is not None:
+            return detected_type.value
+        override = self.config.video_processing.content_type_override
+        if override and override.lower() != "auto":
+            return override
+        return None  # uncertain — LLM decides
+
+    def _extract_spikes(self, audio_path: str, video_id: str) -> list[dict]:
+        """Try heatmap spikes first, fall back to RMS energy spikes."""
+        logger.info("Scanning video for most engaging moments.")
+        heatmap_analyzer = HeatmapAnalyzer()
+        spikes = heatmap_analyzer.analyze_heatmap(video_id)
+        if not spikes:
+            logger.info("No replay data available, using audio energy instead.")
+            energy_analyzer = AudioEnergyAnalyzer()
+            spikes = energy_analyzer.analyze_audio_energy(audio_path)
+        return spikes
+
+    def _select_top_candidates(
+        self, spikes: list[dict], target_clips: int
+    ) -> list[dict]:
+        """Sort spikes by score descending and keep only top (target + margin)."""
+        spikes.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        margin = self.config.clip_selection.candidate_margin
+        pool_size = target_clips + margin
+        top = spikes[:pool_size]
+        logger.info(
+            f"Selected top {len(top)} from {len(spikes)} candidate sections for AI analysis."
+        )
+        return top
+
+    def _slice_candidates(
+        self,
+        audio_path: str,
+        top_candidates: list[dict],
+        video_id: str,
+    ) -> tuple[list[dict], list[tuple], float]:
+        """Slice each candidate's audio window concurrently.
+
+        Returns:
+            (refined_clips, sliced_chunks, clip_ceiling):
+                refined_clips — spikes whose slice failed (error accumulator).
+                sliced_chunks — (i, spike, chunk_path, s_start, s_end) for successful slices.
+                clip_ceiling — default + margin for downstream duration enforcement.
+        """
+        from src.core.workspace import TMP_DIR
+
+        clip_cfg = self.config.clip_selection
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+        clip_ceiling = (
+            clip_cfg.default_clip_duration_seconds + clip_cfg.clip_length_margin_seconds
+        )
+        half_window = clip_ceiling / 2.0 + CANDIDATE_WINDOW_BUFFER
+
+        slicer = AudioSlicer()
+
+        def _slice_chunk(i_spike: tuple[int, dict]) -> tuple:
+            i, spike = i_spike
+            centre = (float(spike["start_time"]) + float(spike["end_time"])) / 2.0
+            s_start = max(0.0, centre - half_window)
+            s_end = centre + half_window
+            chunk_path = str(TMP_DIR / f"audio_{video_id}_{i + 1}.aac")
+            success = slicer.slice_audio_chunk(audio_path, s_start, s_end, chunk_path)
+            return (i, spike, chunk_path, s_start, s_end, success)
+
+        logger.info("Slicing audio from candidate sections.")
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=STT_THREAD_POOL
+        ) as executor:
+            results = list(executor.map(_slice_chunk, enumerate(top_candidates)))
+
+        refined_clips: list[dict] = []
+        sliced_chunks: list[tuple] = []
+        for i, spike, chunk_path, s_start, s_end, success in results:
+            if not success:
+                logger.error(
+                    f"Failed to cut audio clip for candidate {i + 1}. Using original time bounds instead."
+                )
+                refined_clips.append(spike)
+            else:
+                sliced_chunks.append((i, spike, chunk_path, s_start, s_end))
+        return refined_clips, sliced_chunks, clip_ceiling
+
+    def _transcribe_candidate_slices(
+        self,
+        sliced_chunks: list[tuple],
+        force: bool,
+    ) -> tuple[list[tuple], list[dict], list[dict]]:
+        """Transcribe all sliced audio chunks (STT). Local whisper loaded once; cloud via executor.
+
+        Returns:
+            (transcribed_slices, refined_clips, word_cache):
+                transcribed_slices — (i, spike, chunk_path, s_start, s_end, transcript).
+                refined_clips — spikes whose transcription failed (error accumulator).
+                word_cache — per-candidate word segments for render-time reuse.
+        """
+        from src.core.workspace import TMP_DIR
+
+        transcribed_slices: list[tuple] = []
+        whisper_model = None
+
+        stt_provider = self.config.ai_pipeline.stt.provider.lower()
+        stt_api_key = self.config.ai_pipeline.stt.cloud.api_key
+        has_stt_credentials = AIUtils.has_credentials(stt_api_key)
+        use_local_stt = (stt_provider == "local") or (
+            stt_provider == "auto" and not has_stt_credentials
+        )
+
+        if use_local_stt:
+            try:
+                whisper_model_size = self.config.ai_pipeline.stt.local.model_size
+                logger.info(f"Loading speech-to-text model ({whisper_model_size})...")
+                whisper_model = AIUtils.load_whisper_model(
+                    whisper_model_size, self.config.ai_pipeline.stt.local.device
+                )
+            except Exception as e:
+                logger.error(f"Failed to load local transcription model: {e}")
+
+        sub_cfg = self.config.video_processing.subtitles
+        subs_will_render = sub_cfg.enabled
+        local_stt = LocalSTTProvider() if (use_local_stt and subs_will_render) else None
+        if use_local_stt and not subs_will_render:
+            logger.info("Subtitles are turned off, transcribing for AI selection only.")
+
+        def _offset_segments(segs: list[dict], off: float) -> list[dict]:
+            return [
+                {
+                    "text": s["text"],
+                    "start": s["start"] + off,
+                    "end": s["end"] + off,
+                    "words": [
+                        {
+                            "word": w["word"],
+                            "start": w["start"] + off,
+                            "end": w["end"] + off,
+                        }
+                        for w in s.get("words", [])
+                    ],
+                }
+                for s in segs
+            ]
+
+        def _transcribe_chunk(data: tuple) -> tuple:
+            i, spike, chunk_path, s_start, s_end = data
+            logger.info(f"Transcribing candidate section {i + 1}/{len(sliced_chunks)}.")
+            try:
+                if local_stt is not None:
+                    segs = local_stt.transcribe_segments(
+                        chunk_path, model=whisper_model, time_offset=0.0
+                    )
+                    transcript = segments_to_transcript(segs)
+                    abs_segs = _offset_segments(segs, s_start)
+                else:
+                    transcript = self.run_stt_transcription(
+                        chunk_path,
+                        force=force,
+                        whisper_model=whisper_model,
+                        cache_dir=TMP_DIR,
+                    )
+                    abs_segs = None
+                return (
+                    i,
+                    spike,
+                    chunk_path,
+                    s_start,
+                    s_end,
+                    transcript,
+                    abs_segs,
+                    None,
+                )
+            except Exception as e:
+                return (i, spike, chunk_path, s_start, s_end, None, None, e)
+
+        if use_local_stt:
+            logger.info("Transcribing candidate sections with local speech-to-text.")
+            stt_results = [_transcribe_chunk(data) for data in sliced_chunks]
+        else:
+            logger.info("Transcribing candidate sections with cloud speech-to-text.")
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=VISUAL_THREAD_POOL
+            ) as executor:
+                stt_results = list(executor.map(_transcribe_chunk, sliced_chunks))
+
+        refined_clips: list[dict] = []
+        word_cache: list[dict] = []
+        for (
+            i,
+            spike,
+            chunk_path,
+            s_start,
+            s_end,
+            transcript,
+            abs_segs,
+            err,
+        ) in stt_results:
+            if err:
+                logger.error(
+                    f"Transcription failed for candidate {i + 1}: {err}. Using original time position instead."
+                )
+                refined_clips.append(spike)
+            else:
+                transcribed_slices.append(
+                    (i, spike, chunk_path, s_start, s_end, transcript)
+                )
+                if abs_segs is not None:
+                    word_cache.append(
+                        {"start": s_start, "end": s_end, "segments": abs_segs}
+                    )
+
+        if whisper_model is not None:
+            logger.debug("Released local speech-to-text model memory.")
+            del whisper_model
+            gc.collect()
+
+        return transcribed_slices, refined_clips, word_cache
+
+    def _build_candidates_prompt(
+        self,
+        transcribed_slices: list[tuple],
+        visual_by_index: dict[int, str],
+        video_id: str,
+        detected_type: ContentType | None,
+        detection_evidence: dict[str, object] | None,
+    ) -> str:
+        """Build the batched LLM prompt from transcribed slices, visual descriptors, and evidence."""
+        prompt_parts = []
+        speaker_analyzer = AudioEnergyAnalyzer()
+        for idx, (_, _, chunk_path, s_start, s_end, transcript) in enumerate(
+            transcribed_slices
+        ):
+            visual_line = visual_by_index.get(idx)
+            visual_block = f"Visual context: {visual_line}\n" if visual_line else ""
+            speakers = speaker_analyzer.estimate_speaker_count(chunk_path)
+            audio_line = (
+                "Audio: ~2 distinct speakers (leans podcast/collab)\n"
+                if speakers >= 2
+                else "Audio: ~1 speaker (leans solo/just-chat)\n"
+            )
+            prompt_parts.append(
+                f"[Candidate {idx + 1}] Window: [{s_start:.2f}s-{s_end:.2f}s]\n"
+                f"{visual_block}{audio_line}Transcript:\n{transcript}\n"
+            )
+        meta_block = self._load_metadata_context(video_id)
+        evidence_block = ""
+        if detected_type is None and detection_evidence:
+            evidence_block = build_detection_evidence_block(detection_evidence)
+            logger.debug(
+                f"Injecting detection evidence into LLM prompt: "
+                f"{' '.join(f'{k}={v}' for k, v in detection_evidence.items())}"
+            )
+        return evidence_block + meta_block + "\n".join(prompt_parts)
+
+    def _run_batch_llm_and_map(
+        self,
+        transcribed_slices: list[tuple],
+        candidates_text: str,
+        content_type: str | None,
+        target_duration: int,
+        target_clips: int,
+        clip_ceiling: float,
+        clip_cfg: object,
+        detected_type: ContentType | None,
+        detection_evidence: dict[str, object] | None,
+        refined_clips: list[dict],
+    ) -> list[dict]:
+        """Run batched LLM and map results back to the video timeline."""
+        llama_model = None
+        llm_provider = self.config.ai_pipeline.llm.provider.lower()
+        llm_api_key = self.config.ai_pipeline.llm.cloud.api_key
+        use_local_llm = llm_provider == "local" or (
+            llm_provider == "auto" and not AIUtils.has_credentials(llm_api_key)
+        )
+
+        if use_local_llm:
+            try:
+                llm_model_name = self.config.ai_pipeline.llm.local.model_name
+                resolved_path = AIUtils.resolve_llm_model_path(llm_model_name)
+                n_gpu = self.config.ai_pipeline.llm.local.n_gpu_layers
+                logger.info("Loading local AI model for clip selection.")
+                llama_model = AIUtils.load_llama(resolved_path, n_gpu)
+            except Exception as e:
+                logger.error(f"Failed to load local AI reasoning model: {e}")
+
+        try:
+            batch_clips = self.run_batch_llm_analysis(
+                candidates_text=candidates_text,
+                target_clips=target_clips,
+                content_type=content_type,
+                target_duration=target_duration,
+                llama_model=llama_model,
+            )
+
+            for cc in batch_clips:
+                try:
+                    cand_idx = int(cc.get("candidate_index", 1)) - 1
+                    if not (0 <= cand_idx < len(transcribed_slices)):
+                        continue
+                    _, spike, chunk_path, s_start, s_end, _ = transcribed_slices[
+                        cand_idx
+                    ]
+
+                    mapped_start = max(
+                        s_start, s_start + float(cc.get("start_time", 0.0))
+                    )
+                    mapped_end = min(
+                        s_end, s_start + float(cc.get("end_time", s_end - s_start))
+                    )
+
+                    if mapped_end - mapped_start < MIN_CLIP_SECONDS:
+                        logger.warning(
+                            f"Skipping invalid clip from candidate {cand_idx + 1} "
+                            f"({mapped_start:.2f}s-{mapped_end:.2f}s): clip duration too short."
+                        )
+                        continue
+
+                    mapped_start, mapped_end = self._enforce_duration(
+                        mapped_start,
+                        mapped_end,
+                        s_start,
+                        s_end,
+                        clip_cfg.default_clip_duration_seconds,
+                        clip_ceiling,
+                    )
+                    cc["start_time"], cc["end_time"] = mapped_start, mapped_end
+
+                    if detected_type is not None:
+                        cc["content_type"] = detected_type.value
+                    else:
+                        resolved = self._normalise_base_content_type(
+                            cc.get("content_type")
+                        )
+                        if resolved is not None:
+                            cc["content_type"] = resolved
+                        else:
+                            cc.pop("content_type", None)
+                        if detection_evidence:
+                            self._validate_clip_content_type(
+                                cc,
+                                detection_evidence,
+                                cand_idx + 1,
+                                audio_path=str(chunk_path),
+                            )
+
+                    if "Heatmap" not in cc.get("reasoning", ""):
+                        cc["reasoning"] += " (Extracted via Heatmap/Energy Spike)."
+                    refined_clips.append(cc)
+                except Exception as parse_e:
+                    logger.error(f"Failed to parse mapped clip candidate: {parse_e}")
+        except Exception as e:
+            logger.error(
+                f"AI clip selection failed: {e}. Falling back to original candidate positions."
+            )
+            for _, spike, _, _, _, _ in transcribed_slices:
+                refined_clips.append(spike)
+        finally:
+            if llama_model is not None:
+                logger.debug("Released local AI model memory.")
+                del llama_model
+                gc.collect()
+
+        return refined_clips
+
+    @staticmethod
+    def _dedup_finalize(refined_clips: list[dict], target_clips: int) -> list[dict]:
+        """Sort chronological, filter degenerate, dedup (5s tolerance), clamp to target count."""
+        refined_clips.sort(key=lambda x: float(x["start_time"]))
+        final_clips: list[dict] = []
+        last_end = -1.0
+        for c in refined_clips:
+            if float(c["end_time"]) - float(c["start_time"]) < MIN_CLIP_SECONDS:
+                continue
+            if float(c["start_time"]) > last_end - 5:
+                final_clips.append(c)
+                last_end = float(c["end_time"])
+        if len(final_clips) > target_clips:
+            logger.info(
+                f"Reducing clip count from {len(final_clips)} to {target_clips}."
+            )
+            final_clips = final_clips[:target_clips]
+        elif len(final_clips) < target_clips:
+            logger.warning(
+                f"AI returned {len(final_clips)} clips, expected {target_clips}. "
+                "Some candidates may have been dropped during deduplication or duration filtering. "
+                "Consider increasing candidate margin."
+            )
+        logger.info(
+            f"AI finished selecting {len(final_clips)} clips, ready for rendering."
+        )
+        return final_clips
+
+    def process_audio(
+        self,
+        audio_path: str,
+        video_path: str | None = None,
+        force: bool = False,
+        detected_type: ContentType | None = None,
+        detection_evidence: dict[str, object] | None = None,
+        manual_ranges: list[dict[str, Any]] | None = None,
+        no_metadata: bool = False,
+    ) -> list[dict[str, Any]]:
+        """
+        Main AI Orchestrator. Evaluates config to route between Cloud and Local logic.
+        Protects execution using the active_pipeline_event safety guard.
+
+        Args:
+            audio_path: Path to the extracted audio track.
+            video_path: Path to the source video. When provided, each candidate window is
+                visually analysed (YOLOv8n) and a text descriptor is fed to the LLM so clip
+                selection considers on-screen events (mediashare, action) — not audio alone.
+            force: Re-run STT even if a cached transcript exists.
+            detected_type: Video-level content type from ``ContentTypeDetector.detect_content_type``.
+                When confident, it's used for all clips and threaded to the LLM prompt.
+                When None (uncertain), the LLM decides per-clip.
+            detection_evidence: Structured evidence from ``ContentTypeDetectionResult.evidence``.
+                Injected into the LLM prompt when ``detected_type`` is None (uncertain)
+                so the LLM has raw detection numbers and doesn't hallucinate.
+            manual_ranges: User-fixed ``[{"start_time", "end_time"}, ...]`` from
+                ``--timerange-file``. Only used when ``clip_selection.mode == "manual"``.
+            no_metadata: Manual mode only — skip STT+LLM titling entirely and return
+                default-titled clips at the fixed ranges.
+        """
+        active_pipeline_event.set()
+        try:
+            clip_cfg = self.config.clip_selection
+            mode_val = clip_cfg.mode.lower()
+            strategy = clip_cfg.auto_strategy.lower()
+
+            if mode_val == "manual":
+                logger.info(
+                    "Manual mode: using user-fixed timeranges, bypassing AI selection."
+                )
+                return self._process_manual_ranges(
+                    audio_path,
+                    video_path,
+                    manual_ranges or [],
+                    detected_type,
+                    detection_evidence,
+                    no_metadata,
+                    force,
+                )
+
+            strategy_label = {
+                "hybrid": "hybrid",
+                "heatmap": "replay data",
+                "ai": "full AI",
+            }.get(strategy, strategy)
+            logger.info(f"Running in {strategy_label} mode to find the best clips.")
+
+            content_type = self._resolve_content_type(detected_type)
+
+            target_duration = clip_cfg.default_clip_duration_seconds or 60
+            target_clips = clip_cfg.default_clips or 5
+
+            # Check for unified Gemini path (Only when STT and LLM are both cloud Google)
+            if self.is_unified_gemini_possible():
+                logger.info("Using cloud AI for both transcription and clip selection.")
+                try:
+                    return self.run_unified_gemini(
+                        audio_path=audio_path,
+                        content_type=content_type,
+                        target_duration=target_duration,
+                        target_clips=target_clips,
+                        detected_type=detected_type,
+                        detection_evidence=detection_evidence,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Combined Gemini pipeline failed: {e}. Falling back to separate transcription and AI steps."
+                    )
+
+            # Decoupled Pipeline
+            if strategy == "ai":
+                logger.info("Transcribing the full audio for AI analysis.")
+                transcript = self.run_stt_transcription(audio_path, force=force)
+                return self.run_llm_analysis(
+                    transcript,
+                    content_type=content_type,
+                    target_duration=target_duration,
+                    target_clips=target_clips,
+                )
+
+            video_id = Path(audio_path).stem
+
+            spikes = self._extract_spikes(audio_path, video_id)
+            if not spikes:
+                logger.warning(
+                    "No engagement spikes found. Running full audio transcription and AI analysis (this may take longer on long videos)."
+                )
+                transcript = self.run_stt_transcription(audio_path, force=force)
+                return self.run_llm_analysis(
+                    transcript,
+                    content_type=content_type,
+                    target_duration=target_duration,
+                    target_clips=target_clips,
+                )
+
+            if strategy == "heatmap":
+                logger.info("Using replay data peaks directly without AI ranking.")
+                return spikes
+
+            logger.info(f"Found {len(spikes)} candidate sections across the video.")
+            top_candidates = self._select_top_candidates(spikes, target_clips)
+
+            refined_clips, sliced_chunks, clip_ceiling = self._slice_candidates(
+                audio_path,
+                top_candidates,
+                video_id,
+            )
+            if not sliced_chunks:
+                logger.warning(
+                    "Could not cut any audio clips from candidates. Using original time positions instead."
+                )
+                return top_candidates
+
+            transcribed_slices, refined_clips, word_cache = (
+                self._transcribe_candidate_slices(
+                    sliced_chunks,
+                    force,
+                )
+            )
+            if word_cache:
+                save_words_cache(video_id, word_cache)
+
+            # Step 2b: Visual analysis on the SAME candidate windows (audio + vision aligned).
+            # Produces a text descriptor per candidate so a (possibly non-multimodal) LLM can
+            # weigh on-screen events. YOLO is loaded once and freed before the LLM loads.
+            visual_by_index: dict[int, str] = {}
+            region_enabled = self.config.video_processing.region_detection.enabled
+            if video_path and region_enabled and transcribed_slices:
+                from src.vision.visual_analyzer import VisualAnalyzer
+
+                analyzer = VisualAnalyzer()
+                mediashare_cache_entries: list[dict] = []
+
+                # When the video is a known gaming collaboration, lock the webcam pair
+                # so per-candidate log summaries show both webcams consistently.
+                collab_cams: list = []
+                if (
+                    detected_type is not None
+                    and detected_type == ContentType.GAMING_COLLAB
+                ):
+                    collab_cams = analyzer.detect_facecams(Path(video_path))
+                    if len(collab_cams) >= 2:
+                        logger.debug(
+                            f"Passing {len(collab_cams)} locked webcams "
+                            f"to per-candidate scene analysis."
+                        )
+
+                try:
+                    for idx, (_, _, _, s_start, s_end, _) in enumerate(
+                        transcribed_slices
+                    ):
+                        try:
+                            res = analyzer.analyze_window(
+                                Path(video_path),
+                                s_start,
+                                s_end,
+                                facecam_boxes=collab_cams
+                                if len(collab_cams) >= 2
+                                else None,
+                            )
+                            visual_by_index[idx] = res["descriptor"]
+                            # Collect donation scan results so the renderer can reuse them instead
+                            # of rescanning each clip window (avoids the duplicate dense frame scan).
+                            if self.config.video_processing.preserve_donation_overlays:
+                                mediashare_cache_entries.append(
+                                    {
+                                        "start": s_start,
+                                        "end": s_end,
+                                        "mediashare_present": res.get(
+                                            "mediashare_present", False
+                                        ),
+                                        "mediashare_box": res.get("mediashare_box"),
+                                    }
+                                )
+                        except Exception as ve:
+                            logger.warning(
+                                f"Scene analysis failed for candidate {idx + 1}: {ve}"
+                            )
+                finally:
+                    analyzer.release()
+
+                # Persist donation scan results alongside the word-timings cache so the renderer
+                # can look them up per-clip without re-scanning.
+                if mediashare_cache_entries:
+                    save_mediashare_cache(video_id, mediashare_cache_entries)
+
+            # Step 3: Run LLM analysis on all transcripts (Batch LLM Call)
+            if transcribed_slices:
+                candidates_text = self._build_candidates_prompt(
+                    transcribed_slices,
+                    visual_by_index,
+                    video_id,
+                    detected_type,
+                    detection_evidence,
+                )
+
+                refined_clips = self._run_batch_llm_and_map(
+                    transcribed_slices,
+                    candidates_text,
+                    content_type,
+                    target_duration,
+                    target_clips,
+                    clip_ceiling,
+                    clip_cfg,
+                    detected_type,
+                    detection_evidence,
+                    refined_clips,
+                )
+
+            return self._dedup_finalize(refined_clips, target_clips)
+
+        finally:
+            active_pipeline_event.clear()
+
+    @staticmethod
+    def _format_manual_title(start: float, end: float) -> str:
+        """Default manual-mode title, e.g. Manual_1-30_2-30 (MM-SS, or H-MM-SS past an hour)."""
+
+        def _fmt(seconds: float) -> str:
+            total = int(seconds)
+            h, rem = divmod(total, 3600)
+            m, s = divmod(rem, 60)
+            return f"{h}-{m:02d}-{s:02d}" if h else f"{m}-{s:02d}"
+
+        return f"Manual_{_fmt(start)}_{_fmt(end)}"
+
+    def _process_manual_ranges(
+        self,
+        audio_path: str,
+        video_path: str | None,
+        manual_ranges: list[dict[str, Any]],
+        detected_type: ContentType | None,
+        detection_evidence: dict[str, object] | None,
+        no_metadata: bool,
+        force: bool,
+    ) -> list[dict[str, Any]]:
+        """Render exactly the user's fixed timeranges — no selection, dedup, or duration bounds.
+
+        With ``no_metadata=False`` (default), each range is still transcribed and sent
+        through the batched LLM so it gets a real title/caption/description/hashtags —
+        only the boundaries are fixed by the user, not "chosen" by the AI.
+        """
+        # Per-range content_type (from the "| TYPE" suffix) wins over the video-level
+        # detected_type; a range with neither is left untyped so the renderer auto-detects it.
+        candidates = [
+            {
+                "start_time": r["start_time"],
+                "end_time": r["end_time"],
+                "title": self._format_manual_title(r["start_time"], r["end_time"]),
+            }
+            for r in manual_ranges
+        ]
+        for cc, r in zip(candidates, manual_ranges, strict=True):
+            pinned = r.get("content_type")
+            if pinned:
+                cc["content_type"] = pinned
+            elif detected_type is not None:
+                cc["content_type"] = detected_type.value
+
+        if not candidates:
+            logger.warning("Manual mode: no timeranges provided, nothing to render.")
+            return []
+
+        if no_metadata:
+            logger.info(
+                f"Manual mode: --no-metadata set, skipping LLM titling for {len(candidates)} clip(s)."
+            )
+            return candidates
+
+        video_id = Path(audio_path).stem
+        content_type = self._resolve_content_type(detected_type)
+
+        from src.core.workspace import TMP_DIR
+
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        slicer = AudioSlicer()
+
+        def _slice_chunk(i_range: tuple[int, dict]) -> tuple:
+            i, r = i_range
+            s_start, s_end = float(r["start_time"]), float(r["end_time"])
+            chunk_path = str(TMP_DIR / f"audio_{video_id}_manual_{i + 1}.aac")
+            success = slicer.slice_audio_chunk(audio_path, s_start, s_end, chunk_path)
+            return (i, candidates[i], chunk_path, s_start, s_end, success)
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=STT_THREAD_POOL
+        ) as executor:
+            slice_results = list(executor.map(_slice_chunk, enumerate(manual_ranges)))
+
+        sliced_chunks = [
+            (i, sp, cp, ss, se) for i, sp, cp, ss, se, ok in slice_results if ok
+        ]
+        for i, _sp, _cp, ss, se, ok in slice_results:
+            if not ok:
+                logger.error(
+                    f"Failed to cut audio for manual range {i + 1} "
+                    f"({ss:.2f}s-{se:.2f}s); rendering it without a title/caption."
+                )
+
+        if not sliced_chunks:
+            logger.warning(
+                "Manual mode: no audio slices succeeded, using default titles only."
+            )
+            return candidates
+
+        transcribed_slices, _failed, word_cache = self._transcribe_candidate_slices(
+            sliced_chunks, force
+        )
+        if word_cache:
+            save_words_cache(video_id, word_cache)
+
+        visual_by_index: dict[int, str] = {}
+        region_enabled = self.config.video_processing.region_detection.enabled
+        if video_path and region_enabled and transcribed_slices:
+            from src.vision.visual_analyzer import VisualAnalyzer
+
+            analyzer = VisualAnalyzer()
+            try:
+                for pos, (_, _, _, s_start, s_end, _) in enumerate(transcribed_slices):
+                    try:
+                        res = analyzer.analyze_window(Path(video_path), s_start, s_end)
+                        visual_by_index[pos] = res["descriptor"]
+                    except Exception as ve:
+                        logger.warning(
+                            f"Scene analysis failed for manual range {pos + 1}: {ve}"
+                        )
+            finally:
+                analyzer.release()
+
+        if not transcribed_slices:
+            return candidates
+
+        candidates_text = self._build_candidates_prompt(
+            transcribed_slices,
+            visual_by_index,
+            video_id,
+            detected_type,
+            detection_evidence,
+        )
+
+        try:
+            titled = self.run_batch_llm_analysis(
+                candidates_text=candidates_text,
+                target_clips=len(transcribed_slices),
+                content_type=content_type,
+                target_duration=int(
+                    sum(se - ss for _, _, _, ss, se, _ in transcribed_slices)
+                    / len(transcribed_slices)
+                ),
+            )
+        except Exception as e:
+            logger.error(
+                f"Manual mode LLM titling failed: {e}. Keeping default titles."
+            )
+            return candidates
+
+        # Map LLM metadata back onto the original candidate by index — boundaries never change.
+        for cc in titled:
+            try:
+                cand_idx = int(cc.get("candidate_index", 0)) - 1
+                if not (0 <= cand_idx < len(transcribed_slices)):
+                    continue
+                original_pos = transcribed_slices[cand_idx][0]
+                target = candidates[original_pos]
+                for key in ("title", "caption", "description", "hashtags", "reasoning"):
+                    if cc.get(key):
+                        target[key] = cc[key]
+                # Only let the LLM assign a type to ranges that have none — a user-pinned
+                # (or detected) type is never overridden.
+                if "content_type" not in target:
+                    resolved = self._normalise_base_content_type(cc.get("content_type"))
+                    if resolved is not None:
+                        target["content_type"] = resolved
+            except Exception as map_e:
+                logger.error(f"Failed to map manual clip metadata: {map_e}")
+
+        logger.info(f"Manual mode: titled {len(candidates)} clip(s) via LLM.")
+        return candidates

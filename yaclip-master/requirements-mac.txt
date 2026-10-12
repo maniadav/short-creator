@@ -1,0 +1,16 @@
+loguru
+pydantic
+pyyaml
+typer
+gradio
+static-ffmpeg
+yt-dlp
+openai
+google-generativeai
+mediapipe
+huggingface_hub
+faster-whisper
+torch
+torchvision
+opencv-python-headless
+ultralytics

@@ -1,0 +1,61 @@
+FROM dimaskiddo/cuda:12.8-runtime
+MAINTAINER Dimas Restu Hidayanto <drh.dimasrestu@gmail.com>
+
+LABEL maintainer="Dimas Restu Hidayanto <drh.dimasrestu@gmail.com>"
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=Asia/Jakarta \
+    HOME=/
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    YACLIP_FORCE_TRITON=1
+
+WORKDIR /usr/app
+
+# Install system deps: EGL/GLES/GL for MediaPipe, FFmpeg for video processing.
+RUN apt-get -y update --allow-releaseinfo-change \
+    && apt-get -y dist-upgrade \
+    && apt-get -y install --no-install-recommends \
+        libegl1 \
+        libgles2 \
+        libgl1 \
+        ffmpeg \
+        python3 \
+        python3-pip \
+        python3-venv \
+    && apt-get -y purge --autoremove \
+    && apt-get -y clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency manifest first (Docker layer caching).
+COPY requirements-cuda.txt .
+
+# Install packages directly into system Python.
+# CUDA torch replaces CPU-only torch — the CUDA build carries triton, which is
+# required for GPU acceleration.  guard_triton_segfault() in environment.py is
+# automatically disabled when CUDA is present (torch.cuda.is_available() == True).
+# opencv-python-headless prevents display-server crashes in headless containers.
+RUN pip3 install --no-cache-dir --break-system-packages --upgrade \
+        pip \
+        setuptools \
+        wheel \
+    && pip3 install --no-cache-dir --break-system-packages -r requirements-cuda.txt \
+    && pip3 install --no-cache-dir --break-system-packages --force-reinstall --no-deps \
+        opencv-python-headless
+
+# Copy the rest of the application.
+COPY . .
+
+# Persistent workspace: downloads, clips, models, logs survive container restarts.
+VOLUME /usr/app/workspace
+
+# Expose Gradio WebUI port.
+EXPOSE 7860
+
+# Default: serve the WebUI (override via CLI args: `clip <url>`, `cache purge`, etc.).
+# The workspace auto-initialises on first boot (FFmpeg, fonts, dirs).
+ENTRYPOINT ["python3", "app.py"]
+CMD ["serve"]

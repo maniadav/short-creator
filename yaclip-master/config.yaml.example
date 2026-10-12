@@ -1,0 +1,154 @@
+logging:
+  level: "INFO"                        # DEBUG | INFO | WARNING | ERROR
+  file_path: "./workspace/logs/app.log"
+  rotation: "50 MB"
+  retention: "7 days"
+
+web_server:
+  host: "127.0.0.1"
+  port: 7860
+  share: false
+
+ai_pipeline:
+  stt:
+    provider: "local"                  # cloud | local | auto (auto = try cloud, fall back to local)
+    cloud:
+      provider: "google"               # google | openai
+      base_url: null                   # null = provider default; set for OpenRouter, ElevenLabs, or self-hosted OpenAI-compatible STT
+      api_key: "your-api-key-here"
+      model: "gemini-2.5-flash"        # Used for google; openai uses this model name against the endpoint
+      timeout: 300                     # Request timeout in seconds for cloud STT calls (30-600).
+                                       # Increase for long audio files or slow network connections.
+    local:
+      device: "auto"                   # auto | cpu | cuda
+      model_size: "large-v3"           # tiny | base | small | medium | large-v3
+      advanced:
+        beam_size: 5                   # 1 = greedy (deterministic, fastest; best with temperature [0.0])
+                                       #   5 = beam search (slower, no benefit at temp 0.0 but kept as default)
+        vad_threshold: 0.3             # VAD sensitivity 0.0-1.0. Lower = more aggressive speech detection
+                                       #   over music/noise. Default 0.5; 0.3 = music-optimized.
+        vad_min_silence_ms: 250        # Min silence to split segments. 250 ms = music-optimized;
+                                       #   1000 ms = speech-optimized (original). Shorter = cleaner VAD slices.
+        suppress_blank: false          # true = suppress blank outputs at end of speech segments
+        hallucination_gate: "and"      # "and" = drop segment only when BOTH no_speech AND low_logprob fail
+                                       # "or"  = drop when EITHER fails (stricter, for music-heavy audio)
+        repeat_token_ratio_max: 0.6    # If >60% of tokens are the same word → hallucination
+        repetition_penalty: 1.1        # Whisper repetition penalty (1.0 = off, higher = more penalized)
+
+  llm:
+    provider: "cloud"                  # cloud | local | auto (auto = try cloud, fall back to local)
+    cloud:
+      provider: "google"               # google | openai (openai covers OpenRouter and compatible APIs)
+      base_url: null                   # null = provider default; set for OpenRouter or self-hosted endpoints
+      api_key: "your-api-key-here"
+      model: "gemini-2.5-flash"
+      timeout: 300                     # Request timeout in seconds for cloud LLM calls (30-600).
+                                       # Increase for long transcripts or batch selection with many candidates.
+    local:
+      device: "auto"                   # auto | cpu | cuda
+      n_gpu_layers: 0                  # 0 = CPU only; -1 = all layers to GPU
+      model_name: "microsoft/Phi-3-mini-4k-instruct-gguf:q4"
+
+downloader:
+  target_resolution: "1080p"
+  video_format: "mp4"
+  audio_format: "aac"
+  audio_quality: "192k"
+  retry:
+    max_attempts: 3               # Python wrapper retries around entire download (1-10)
+    delay_seconds: 2.0            # Initial backoff delay between retries (0.5-60.0)
+    socket_timeout: 30            # Socket-level timeout for yt-dlp (10-300)
+    fragment_retries: 15          # yt-dlp fragment-level retries (1-100) — catches partial reads
+
+clip_selection:
+  mode: "auto"                         # auto = AI detects clips | manual = user provides timestamps
+  auto_strategy: "hybrid"              # For auto mode only: ai | heatmap | hybrid
+  candidate_margin: 2                  # RMS/heatmap produces N spikes; LLM receives top (target_clips + margin)
+                                       # e.g. 5 clips + 2 = top 7 candidates sent to LLM, rest discarded
+                                       # Additive (not ×): 15 clips + 2 = 17, not 30 — keeps STT cost bounded
+                                       # Min: 0 (exact count, no selection) | Recommended: 2 | Max: 15
+  require_review_before_render: true   # Show review panel before rendering starts
+  heatmap_threshold_percentile: 85     # Minimum heatmap spike percentile to qualify as a clip candidate
+  spike_pool_size: 35                  # Raw candidate pool size from RMS energy analysis before STT/LLM filtering
+                                       # Higher = more options for LLM to select from, at negligible compute cost
+                                       # Range: 10-200 | Recommended: 35
+  min_clips: 1
+  max_clips: 25
+  default_clips: 5
+  # Clip length = [default, default + margin]. e.g. default 60 + margin 15 -> clips run 60-75s.
+  default_clip_duration_seconds: 60  # TARGET clip length (and the floor every clip is extended up to)
+  clip_length_margin_seconds: 15     # a clip may run up to default+margin (caps overly-long picks)
+  min_clip_duration_seconds: 30      # WebUI duration-slider LOWER bound (not a per-clip floor)
+  max_clip_duration_seconds: 180     # WebUI duration-slider UPPER bound (not a per-clip cap)
+
+video_processing:
+  output_dir: "./workspace/clips"
+  device: "auto"                       # auto | cpu | cuda
+  video_encoder: "auto"                # auto | cpu | nvenc | qsv | videotoolbox — FFmpeg H.264 encoder.
+                                       #   auto = nvenc if CUDA else cpu (libx264). GPU encoders that
+                                       #   fail at runtime auto-fall back to libx264, so auto is safe.
+  fast_mode: false                     # true = low-spec PODCAST tracking via OpenCV Haar largest-face
+                                       #   (no MediaPipe/audio, no multi-speaker). Does not affect
+                                       #   content-type detection or gaming/just-chat layouts.
+  camera_pan_speed: 0.03               # How fast the camera glides toward its target. Higher = snappier.
+                                       #   Range: 0.01 (slow ease) to 0.3 (near-instant).
+  content_type_override: "auto"        # auto | PODCAST | JUST_CHAT | GAMING_SOLO | GAMING_SOLO_BOTTOM | GAMING_COLLAB | DONATION_OVERLAY
+                                       #   GAMING_SOLO_BOTTOM = GAMING_SOLO mirrored (facecam bottom, gameplay
+                                       #   top). Never auto-detected/LLM-assigned — override or manual-pin only.
+  detection_confidence_threshold: 0.6  # Below this, detection falls back to PODCAST and logs a warning
+  auto_face_tracking: true             # Smooth face-centered crop for all layout modes
+  preserve_donation_overlays: false    # Master on/off for donation/MediaShare handling. true = auto-detect
+                                       #   popups, route clips to DONATION_OVERLAY layout, and composite
+                                       #   Trakteer/MediaShare alerts. false = skip all donation scans
+                                       #   (faster) and never auto-route to DONATION_OVERLAY.
+  donation_overlay_exclude_types:      # Content types excluded from per-clip donation routing.
+    - "PODCAST"                        #   PODCAST = pre-recorded content; live donation popups never appear.
+    - "GAMING_COLLAB"                  #   GAMING_COLLAB = popup must not displace a collab panel in the 3-stack.
+                                       #   Remove a type from this list to allow donation routing for it.
+                                       #   Valid values: PODCAST | JUST_CHAT | GAMING_SOLO | GAMING_COLLAB
+  default_resolution: "1080p"
+  region_detection:                    # YOLOv8n visual analysis: facecam / gameplay / mediashare regions
+    enabled: true                      # false = fall back to motion/face heuristics only
+    device: "auto"                     # auto | cpu | cuda
+    model_name: "yolov8n.pt"           # Ultralytics COCO nano model (auto-downloaded to workspace/models/)
+    sample_frames: 4                   # Frames sampled per candidate/clip window (sparse = fast)
+    gameplay_follow_motion: true       # true = animated motion-following pan | false = static centred crop
+    gameplay_zoom: 1.25                # >1 zooms the gameplay panel tighter (1.25 = 25% closer, crops the ticker out)
+  subtitles:
+    enabled: true
+    collab_enabled: false              # subtitles on 3-stack GAMING_COLLAB (cramped) — off by default
+    uppercase: true                    # render caption text in CAPITALS for readability
+    language: "auto"                   # auto = detect from audio | ISO 639-1 code or name (34 languages)
+    stt_context: ""                    # optional vocab hint for STT accuracy: names/game/terms, e.g. "Trakteer, Monument Valley"
+    font_file: "Anton.ttf"
+    font_size: 80
+    primary_color: "#FFFFFF"           # hex #RRGGBB (legacy ASS &HAABBGGRR still accepted); white text
+    highlight_color: "#96C8FF"         # active-word colour — soft blue, eye-friendly
+    outline_color: "#000000"           # caption outline — black
+    outline_thickness: 6
+    bold: true
+    shadow: true
+    alignment: bottom-center           # bottom-left | bottom-center | center | top-center | ... (or ASS int)
+    margin_v: 760                      # bottom margin in px (bottom-center alignment) — 760px up from canvas bottom = ~60% down from top
+    timing:
+      word_duration_min_ms: 80
+      word_duration_max_ms: 2000
+      gap_smooth_ms: 150
+      collapse_min_repeats: 3
+      line_max_words: 3
+      line_gap_seconds: 0.8
+
+workspace_cleanup:
+  enabled: true
+  run_on_startup: true
+  dry_run: false                       # true = log candidates without deleting; use to validate retention settings
+  retention_days:
+    videos: 3                          # Raw yt-dlp downloads — set to -1 to disable purge for this dir
+    audios: 3                          # Extracted audio tracks
+    subtitles: 3                       # ASS subtitle files
+    data: 3                            # STT transcripts + AI/cache JSON (clip proposals, word timings, mediashare cache)
+    tmp: 1                             # FFmpeg scratch files — purge aggressively; 0 = purge every run
+  protected_dirs:                      # These directories are NEVER touched by auto-purge
+    - "bin"
+    - "fonts"
+    - "models"
